@@ -1,22 +1,29 @@
 Description: |
     ===================================================
-     ============ECR-Scan-Findings-Logger=============    
+     ============ECR-Scan-Findings-Logger=============
     ===================================================
 
-Resources:
+Parameters:
+  EmailAddress:
+    Type: String
+    Description: The email address to subscribe to the SNS topic.
 
+Conditions:
+  HasEmailAddress: !Not [!Equals [!Ref EmailAddress, ""]]
+
+Resources:
   LambdaExecutionRole:
     Type: AWS::IAM::Role
     Properties:
-      AssumeRolePolicyDocument: 
+      AssumeRolePolicyDocument:
         Version: "2012-10-17"
-        Statement: 
-          - 
+        Statement:
+          -
             Effect: "Allow"
-            Principal: 
-              Service: 
+            Principal:
+              Service:
                 - "lambda.amazonaws.com"
-            Action: 
+            Action:
               - "sts:AssumeRole"
       Policies:
       -
@@ -26,14 +33,24 @@ Resources:
           Statement:
           -
             Effect: "Allow"
-            Action: 
+            Action:
               - "ecr:DescribeImageScanFindings"
               - "logs:CreateLogStream"
               - "logs:GetLogEvents"
               - "logs:PutLogEvents"
               - "logs:CreateLogGroup"
+              - "logs:PutSubscriptionFilter"
             Resource: "*"
-
+      -
+        PolicyName: "PutSubscriptionFilter"
+        PolicyDocument:
+          Version: "2012-10-17"
+          Statement:
+          -
+            Effect: "Allow"
+            Action:
+              - "iam:PassRole"
+            Resource: !GetAtt CloudWatchLogsToFirehoseRole.Arn
 
   ECRSFLFunction:
     Type: AWS::Lambda::Function
@@ -43,20 +60,26 @@ Resources:
       Handler: index.lambda_handler
       MemorySize: 128
       Role: !GetAtt LambdaExecutionRole.Arn
-      Runtime: python3.8
+      Runtime: python3.10
       Timeout: 900
+      Environment:
+        Variables:
+          FIREHOSE_ARN: !GetAtt FirehoseDeliveryStream.Arn
+          CLOUDWATCH_ROLE_ARN: !GetAtt CloudWatchLogsToFirehoseRole.Arn
       Code:
         ZipFile: |
           import boto3
           import json
           import time
           import botocore
-          
+          import os
+
           def lambda_handler (event, context):
+              print('Received event: ' + json.dumps(event, indent=2))
               # Setting the client for ECR (client), and for CloudWatch (cwclient)
               client = boto3.client('ecr')
               cwclient = boto3.client('logs')
-              
+
               millis = int(round(time.time() * 1000))
 
               # Getting information from the event, to use it in the 'describe_image_scan_findings' API request
@@ -73,17 +96,18 @@ Resources:
               )
 
               # Try to create a Log Group for the repository with the repo's name passed in the event, if it already exists (from a previous scan, for example), creation will be aborted. Log group name format: /aws/ecr/image-scan-findings/repo-name
-              
+
               RepoLogGroupName = '/aws/ecr/image-scan-findings/'+event['detail']['repository-name']
               try:
                   cwclient.create_log_group(
                       logGroupName=RepoLogGroupName
                   )
+                  create_logs_filter(cwclient, RepoLogGroupName)
               except cwclient.exceptions.ResourceAlreadyExistsException:
                   print('Log Group already exists for the repo '+RepoLogGroupName+ ', creating aborted')
 
               # Create Log streams, one log stream for each severity, and one for total numbers (summary)
-              SummaryLogStream = 'SUMMARY-'+event['detail']["image-tags"][0]+'-'+event['detail']["image-digest"].replace ('sha256:','')+'-'+event['time'].replace(':','-')
+              SummaryLogStream = 'SUMMARY-'+event['detail']["image-tags"][0]+'-'+event['detail']["image-digest"].replace ('sha256:','')+'-'+event['time'].replace(':','-') + '-' + str(millis)
               cwclient.create_log_stream(logGroupName=RepoLogGroupName,logStreamName= SummaryLogStream)
               cwclient.put_log_events(logGroupName=RepoLogGroupName, logStreamName=SummaryLogStream,
                           logEvents=[
@@ -101,7 +125,7 @@ Resources:
               # Log stream name format: SEVERITY-IMAGE_TAG-DIGEST-TIME_OF_SCAN, only dashes with no colons
               # Log stream names are uniquely named, as it uses the 'time' value from the scan complete ECR event.
               for i in response['imageScanFindings']['findingSeverityCounts']:
-                  StreamName = i+'-'+event['detail']["image-tags"][0]+'-'+event['detail']["image-digest"].replace ('sha256:','')+'-'+event['time'].replace(':','-')
+                  StreamName = i+'-'+event['detail']["image-tags"][0]+'-'+event['detail']["image-digest"].replace ('sha256:','')+'-'+event['time'].replace(':','-') + '-' + str(millis)
                   StreamNameDictMapping[i] = StreamName
                   cwclient.create_log_stream(
                       logGroupName=RepoLogGroupName,
@@ -130,23 +154,38 @@ Resources:
 
 
               print('Scan logging for '+ event['detail']["image-digest"]+':'+event['detail']["image-tags"][0]+ ' is complete.')
-          
+
+          def create_logs_filter (cwclient, log_group_name):
+            firehose_arn = os.getenv('FIREHOSE_ARN')
+            role_arn = os.getenv('CLOUDWATCH_ROLE_ARN')  # Assuming this is also provided via environment
+            # Log group name prefixes to create subscription filters for
+            log_group_name_prefixes = ['SUMMARY-']
+            for prefix in log_group_name_prefixes:
+              cwclient.put_subscription_filter(
+                        logGroupName=log_group_name,
+                        filterName=f'{prefix}SubscriptionFilter',
+                        filterPattern='',
+                        destinationArn=firehose_arn,
+                        roleArn=role_arn
+                    )
+            print("Filter setup completed.")
+
   EventTrigger:
     Type: AWS::Events::Rule
     Properties:
       Description: Trigger for the Lambda function (Scan-Findings-Logger) to execute if a scan is completed
       EventPattern:
         source:
-          - "aws.ecr" 
+          - "aws.ecr"
         detail-type:
-          - "ECR Image Scan" 
+          - "ECR Image Scan"
         detail:
           scan-status:
             - "COMPLETE"
 
       State:  "ENABLED"
       Targets:
-      - 
+      -
         Arn: !GetAtt ECRSFLFunction.Arn
         Id: Scan-Findings-Logger
 
@@ -157,3 +196,119 @@ Resources:
       FunctionName: !GetAtt ECRSFLFunction.Arn
       Principal: events.amazonaws.com
       SourceArn: !GetAtt EventTrigger.Arn
+
+  CloudWatchLogsToFirehoseRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Principal:
+              Service:
+                - !Sub "logs.${AWS::Region}.amazonaws.com"
+            Action: "sts:AssumeRole"
+      Policies:
+        - PolicyName: "CloudWatchLogsToFirehosePolicy"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: "Allow"
+                Action:
+                  - "firehose:PutRecord"
+                  - "firehose:PutRecordBatch"
+                Resource: !GetAtt FirehoseDeliveryStream.Arn
+
+  ScanFindingsBucket:
+    Type: AWS::S3::Bucket
+    DependsOn: SNSTopic
+    Properties:
+      BucketName: !Sub "scan-findings-stream-${AWS::AccountId}-${AWS::Region}"
+      NotificationConfiguration:
+        TopicConfigurations:
+          - Event: "s3:ObjectCreated:*"
+            Topic: !Ref SNSTopic
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        IgnorePublicAcls: true
+        BlockPublicPolicy: true
+        RestrictPublicBuckets: true
+
+  SNSTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: Scan-Findings-Topic
+
+  SNSTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics:
+        - !Ref SNSTopic
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: "Alllow S3 to publish"
+            Effect: "Allow"
+            Principal:
+              Service: "s3.amazonaws.com"
+            Action: "sns:Publish"
+            Resource: !Ref SNSTopic
+
+  SNSEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      Endpoint: !Ref EmailAddress
+      Protocol: email
+      TopicArn: !Ref SNSTopic
+    Condition: HasEmailAddress
+
+  FirehoseDeliveryStream:
+    Type: AWS::KinesisFirehose::DeliveryStream
+    Properties:
+      DeliveryStreamName: Scan-Findings-Stream
+      DeliveryStreamType: DirectPut
+      ExtendedS3DestinationConfiguration:
+        BucketARN: !GetAtt ScanFindingsBucket.Arn
+        RoleARN: !GetAtt FirehoseRole.Arn
+        ProcessingConfiguration:
+          Enabled: true
+          Processors:
+            - Type: Decompression
+              Parameters:
+                - ParameterName: 'CompressionFormat'
+                  ParameterValue: 'GZIP'
+            - Type: CloudWatchLogProcessing
+              Parameters:
+                - ParameterName: 'DataMessageExtraction'
+                  ParameterValue: true
+
+
+  FirehoseRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: firehose.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: FirehoseToS3AndSNSPolicy
+          PolicyDocument:
+            Version: 2012-10-17
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "s3:AbortMultipartUpload"
+                  - "s3:GetBucketLocation"
+                  - "s3:GetObject"
+                  - "s3:ListBucket"
+                  - "s3:ListBucketMultipartUploads"
+                  - "s3:PutObject"
+                Resource:
+                  - !GetAtt ScanFindingsBucket.Arn
+                  - !Sub "${ScanFindingsBucket.Arn}/*"
+              - Effect: Allow
+                Action: "sns:Publish"
+                Resource: !Ref SNSTopic
