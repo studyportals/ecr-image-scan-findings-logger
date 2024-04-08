@@ -117,8 +117,6 @@ Resources:
               StreamNameDictMapping = {}
               # SequenceTokenDict maps each severity (key) to sequenceToken (value), used for put_log_events later
               SequenceTokenDict = {}
-              print('Logging scan findings for '+ event['detail']["image-digest"]+':'+event['detail']["image-tags"][0])
-              print(response['imageScanFindings'])
               # Log stream name format: SEVERITY-IMAGE_TAG-DIGEST-TIME_OF_SCAN, only dashes with no colons
               # Log stream names are uniquely named, as it uses the 'time' value from the scan complete ECR event.
               for i in response['imageScanFindings']['findingSeverityCounts']:
@@ -132,9 +130,6 @@ Resources:
 
               # The following loop with 'put_log_events' will go through each finding, and based on severity, puts each finding in the corresponding log stream
               for i in response['imageScanFindings']['findings']:
-                  print("-----------")
-                  print(json.dumps(i))
-                  print("-----------")
                   severity = i['severity']
 
                   loggingResponse = cwclient.put_log_events(
