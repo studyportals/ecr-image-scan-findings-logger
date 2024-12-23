@@ -8,6 +8,18 @@ Parameters:
     Type: String
     Description: The email address to subscribe to the SNS topic.
 
+Metadata:
+  AWS::CloudFormation::Interface:
+    Tags:
+      - Key: "sp:Domain"
+        Value: "Platform Operations"
+      - Key: "sp:Environment"
+        Value: "dev"
+      - Key: "sp:Service"
+        Value: "ECR-SFL"
+      - Key: "sp:Owner"
+        Value: "platformoperations@studyportals.com"
+
 Resources:
 
   LambdaExecutionRole:
