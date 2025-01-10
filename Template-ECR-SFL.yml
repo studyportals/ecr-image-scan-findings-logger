@@ -7,9 +7,20 @@ Parameters:
   EmailAddress:
     Type: String
     Description: The email address to subscribe to the SNS topic.
+  spDomain:
+    Type: String
+    Default: "Platform Operations"
+  spEnvironment:
+    Type: String
+    Default: "dev"
+  spService:
+    Type: String
+    Default: "ECR-SFL"
+  spOwner:
+    Type: String
+    Default: "platformoperations@studyportals.com"
 
 Resources:
-
   LambdaExecutionRole:
     Type: AWS::IAM::Role
     Properties:
@@ -48,7 +59,6 @@ Resources:
             Action:
               - "sns:Publish"
             Resource: !Ref SNSTopic
-
 
   ECRSFLFunction:
     Type: AWS::Lambda::Function
@@ -190,7 +200,16 @@ Resources:
                       print(f'Message for {severity} findings sent. Message ID: {response["MessageId"]}')
                   else:
                       print(f'No findings for {severity}.')
-
+      Tags:
+        - Key: sp:Domain
+          Value: !Ref spDomain
+        - Key: sp:Environment
+          Value: !Ref spEnvironment
+        - Key: sp:Service
+          Value: !Ref spService
+        - Key: sp:Owner
+          Value: !Ref spOwner
+  
   EventTrigger:
     Type: AWS::Events::Rule
     Properties:
@@ -218,11 +237,20 @@ Resources:
       Principal: events.amazonaws.com
       SourceArn: !GetAtt EventTrigger.Arn
 
-
   SNSTopic:
     Type: AWS::SNS::Topic
     Properties:
       TopicName: ECR-Scan-Findings-Topic
+      Tags:
+      - Key: sp:Domain
+        Value: !Ref spDomain
+      - Key: sp:Environment
+        Value: !Ref spEnvironment
+      - Key: sp:Service
+        Value: !Ref spService
+      - Key: sp:Owner
+        Value: !Ref spOwner
+
   SNSEmailSubscription:
       Type: AWS::SNS::Subscription
       Properties:
